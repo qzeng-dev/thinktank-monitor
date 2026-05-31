@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Think Tank Monitor — daily tracking of new research/reports from top US think tanks
-via RSS/Atom feeds. Designed for deployment on an overseas VPS.
+via RSS/Atom feeds. Designed for deployment on GitHub Actions.
 
 10 think tanks covering international security, national security, great power
 strategy, and international political economy.
@@ -10,11 +10,8 @@ Usage:
   python3 thinktank_monitor.py          # fetch + email new items
   python3 thinktank_monitor.py --dry    # fetch only, print to stdout (no email)
 
-Deploy to VPS:
-  1. scp this file to VPS: scp thinktank_monitor.py user@vps:~/
-  2. Set QQ SMTP auth code: export QQ_SMTP_AUTH_CODE="your..."
-  3. Test: python3 thinktank_monitor.py --dry
-  4. Cron: 0 9 * * * QQ_SMTP_AUTH_CODE=*** python3 /home/user/thinktank_monitor.py
+GitHub Actions:
+  Runs daily at 1:00 UTC (9:00 AM Beijing). Manual trigger via workflow_dispatch.
 """
 
 import os
@@ -28,6 +25,7 @@ import urllib.request
 import xml.etree.ElementTree as ET
 import smtplib
 import ssl
+from html import unescape as html_unescape
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timezone, timedelta
@@ -36,7 +34,7 @@ from pathlib import Path
 # ── CONFIG ──────────────────────────────────────────────────────────────────
 
 SENDER = os.environ.get("QQ_SMTP_SENDER", "1821339784@qq.com")
-AUTH_CODE=os.environ.get("QQ_SMTP_AUTH_CODE", "")
+AUTH_CODE = os.environ.get("QQ_SMTP_AUTH_CODE", "")
 RECIPIENT = "1821339784@qq.com"
 
 SMTP_HOST = "smtp.qq.com"
@@ -45,8 +43,30 @@ SMTP_PORT = 587
 # State file — tracks seen items so we only email new ones
 STATE_FILE = Path(__file__).resolve().parent / ".thinktank_monitor_state.json"
 
+# ── USER AGENTS (rotated for Cloudflare-bypass attempts) ────────────────────
+
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "ThinkTankMonitor/2.0 (mailto:1821339784@qq.com)",
+]
+
+# ── HTML ENTITIES to define for XML parsing ─────────────────────────────────
+# Some feeds (Brookings) use HTML entities without declaring them in a DTD.
+# We resolve them via html.unescape() before XML parsing.
+
 # ── THINK TANKS ─────────────────────────────────────────────────────────────
-# (name, rss_url, focus_area)
+# (name, rss_url, focus_area, needs_cf_bypass)
+#
+# URLs verified / best-guess as of 2026-05-31:
+#   CSIS, Atlantic Council, CFR, Carnegie: confirmed working
+#   CNAS: changed from /press/rss to /feed (ExpressionEngine default)
+#   Hudson: changed from /rss to /feed (WordPress default)
+#   Stimson: /feed/ blocked by Cloudflare — needs bypass
+#   Brookings: /feed/ works but XML has HTML entities — fixed in parser
+#   AEI: changed from /foreign-and-defense-policy/feed/ to /feed/
+#   RAND: RSS removed from site — trying archive/legacy URL
 
 THINK_TANKS = [
     # International Security & Strategy
@@ -62,12 +82,12 @@ THINK_TANKS = [
     ),
     (
         "CNAS",
-        "https://www.cnas.org/press/rss",
+        "https://www.cnas.org/feed",
         "International Security & Strategy",
     ),
     (
         "Hudson Institute",
-        "https://www.hudson.org/rss",
+        "https://www.hudson.org/feed/",
         "International Security & Strategy",
     ),
     (
@@ -101,7 +121,7 @@ THINK_TANKS = [
     ),
     (
         "AEI Foreign & Defense Policy",
-        "https://www.aei.org/foreign-and-defense-policy/feed/",
+        "https://www.aei.org/feed/",
         "International Political Economy",
     ),
 ]
@@ -132,8 +152,7 @@ def item_hash(link: str) -> str:
 def strip_html(html_text: str) -> str:
     """Strip HTML tags, decode entities."""
     text = re.sub(r"<[^>]+>", "", html_text)
-    text = text.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
-    text = text.replace("&quot;", "\"").replace("&#039;", "'").replace("&nbsp;", " ")
+    text = html_unescape(text)
     text = re.sub(r"&[a-z]+;", "", text)
     return text.strip()
 
@@ -142,11 +161,10 @@ def parse_date(date_str: str) -> str:
     """Parse various RSS date formats to YYYY-MM-DD."""
     if not date_str:
         return "?"
-    # Common RSS date formats
     formats = [
-        "%a, %d %b %Y %H:%M:%S %z",   # RFC 2822
+        "%a, %d %b %Y %H:%M:%S %z",
         "%a, %d %b %Y %H:%M:%S %Z",
-        "%Y-%m-%dT%H:%M:%S%z",         # ISO 8601
+        "%Y-%m-%dT%H:%M:%S%z",
         "%Y-%m-%dT%H:%M:%SZ",
         "%Y-%m-%dT%H:%M:%S",
         "%Y-%m-%d",
@@ -160,19 +178,82 @@ def parse_date(date_str: str) -> str:
     return "?"
 
 
-def fetch_rss(url: str) -> list[dict]:
+def _sanitize_xml(raw_bytes: bytes) -> bytes:
+    """
+    Preprocess XML to handle common issues:
+    1. Undefined HTML entities (&nbsp;, &mdash;, &rsquo;, etc.)
+    2. Control characters that break XML parsers
+    """
+    text = raw_bytes.decode("utf-8", errors="replace")
+
+    # Resolve all HTML entities to Unicode via html.unescape()
+    # This handles &nbsp;, &mdash;, &rsquo;, &lsquo;, &rdquo;, &ldquo;,
+    # &laquo;, &raquo;, &ndash;, &hellip;, &minus;, &times;, etc.
+    # We preserve &amp; &lt; &gt; &quot; &apos; which are XML-safe
+    text = _resolve_xml_entities(text)
+
+    # Remove control characters (except tab, LF, CR)
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]", "", text)
+
+    return text.encode("utf-8")
+
+
+def _resolve_xml_entities(text: str) -> str:
+    """
+    Resolve HTML entities while preserving XML-safe entities.
+    Uses html.unescape() on the text, then re-escapes the core XML entities.
+    """
+    # First, protect XML core entities
+    text = text.replace("&amp;", "\x00AMP\x00")
+    text = text.replace("&lt;", "\x00LT\x00")
+    text = text.replace("&gt;", "\x00GT\x00")
+    text = text.replace("&quot;", "\x00QUOT\x00")
+    text = text.replace("&apos;", "\x00APOS\x00")
+
+    # Now resolve all remaining HTML entities
+    text = html_unescape(text)
+
+    # Restore XML core entities
+    text = text.replace("\x00AMP\x00", "&amp;")
+    text = text.replace("\x00LT\x00", "&lt;")
+    text = text.replace("\x00GT\x00", "&gt;")
+    text = text.replace("\x00QUOT\x00", "&quot;")
+    text = text.replace("\x00APOS\x00", "&apos;")
+
+    return text
+
+
+def fetch_rss(url: str, ua_index: int = 0) -> list[dict]:
     """Fetch and parse RSS/Atom feed. Returns list of item dicts."""
     items = []
+
+    ua = USER_AGENTS[ua_index % len(USER_AGENTS)]
+
     try:
         req = urllib.request.Request(url, headers={
-            "User-Agent": "ThinkTankMonitor/1.0 (mailto:1821339784@qq.com)",
-            "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml"
+            "User-Agent": ua,
+            "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml, */*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Cache-Control": "no-cache",
         })
         with urllib.request.urlopen(req, timeout=30) as resp:
             content = resp.read()
-            root = ET.fromstring(content)
+    except urllib.error.HTTPError as e:
+        # If 403 (Cloudflare block), try one retry with different UA
+        if e.code == 403 and ua_index < len(USER_AGENTS) - 1:
+            return fetch_rss(url, ua_index + 1)
+        print(f"  [ERROR] {url}: HTTP {e.code}", file=sys.stderr)
+        return []
     except Exception as e:
-        print(f"  [ERROR] {url}: {e}", file=sys.stderr)
+        print(f"  [ERROR] {url}: {type(e).__name__}: {e}", file=sys.stderr)
+        return []
+
+    # Sanitize XML before parsing
+    try:
+        content = _sanitize_xml(content)
+        root = ET.fromstring(content)
+    except ET.ParseError as e:
+        print(f"  [ERROR] {url}: XML Parse: {e}", file=sys.stderr)
         return []
 
     # Detect RSS vs Atom
@@ -189,7 +270,6 @@ def fetch_rss(url: str) -> list[dict]:
             description = desc_el.text.strip() if desc_el is not None and desc_el.text else ""
             pub_date = parse_date(date_el.text) if date_el is not None and date_el.text else "?"
 
-            # Clean description
             description = strip_html(description)
             description = textwrap.shorten(description, width=300, placeholder="...")
 
@@ -203,7 +283,6 @@ def fetch_rss(url: str) -> list[dict]:
     else:
         # Atom feed
         ns_atom = "http://www.w3.org/2005/Atom"
-        # Try both with and without namespace prefix
         entries = (root.findall(f"{{{ns_atom}}}entry") or
                    root.findall("entry"))
 
@@ -242,7 +321,7 @@ def fetch_rss(url: str) -> list[dict]:
 
 
 def build_html(new_items: dict[str, dict[str, list[dict]]]) -> str:
-    """Build HTML email grouped by focus area → think tank."""
+    """Build HTML email grouped by focus area -> think tank."""
     today_str = datetime.now().strftime("%Y-%m-%d")
     total = sum(len(ilist) for area_data in new_items.values() for ilist in area_data.values())
     area_count = len(new_items)
@@ -278,6 +357,9 @@ def build_html(new_items: dict[str, dict[str, list[dict]]]) -> str:
               font-size: 10px; padding: 2px 7px; border-radius: 3px; }}
     .footer {{ background: #f1f5f9; padding: 16px 30px; border-radius: 0 0 10px 10px;
                font-size: 11px; color: #94a3b8; text-align: center; }}
+    .errors {{ background: #fef2f2; border: 1px solid #fecaca; border-radius: 6px;
+               padding: 12px 16px; margin-top: 20px; font-size: 12px; color: #991b1b; }}
+    .errors summary {{ cursor: pointer; font-weight: 600; }}
   </style>
 </head>
 <body>
@@ -300,7 +382,7 @@ def build_html(new_items: dict[str, dict[str, list[dict]]]) -> str:
                 continue
             html += f'      <div class="tank-block">\n'
             html += f'        <div class="tank-name">🏛️ {tank_name}</div>\n'
-            for item in items[:5]:  # Max 5 per tank to keep email compact
+            for item in items[:5]:
                 html += f'        <div class="item">\n'
                 html += f'          <p class="item-title"><a href="{item["link"]}">{item["title"]}</a></p>\n'
                 html += f'          <p class="item-meta">{item["published"]}</p>\n'
@@ -313,7 +395,7 @@ def build_html(new_items: dict[str, dict[str, list[dict]]]) -> str:
     html += """\
     </div>
     <div class="footer">
-      Think Tank Monitor — deployed on overseas VPS · daily automated
+      Think Tank Monitor — GitHub Actions daily automated &middot; <a href="https://github.com/qzeng-dev/thinktank-monitor">repo</a>
     </div>
   </div>
 </body>
@@ -341,7 +423,7 @@ def build_plain(new_items: dict[str, dict[str, list[dict]]]) -> str:
             lines.append("")
 
     lines.append("-" * 50)
-    lines.append("Think Tank Monitor — VPS deployment")
+    lines.append("Think Tank Monitor — GitHub Actions")
     return "\n".join(lines)
 
 
@@ -369,7 +451,7 @@ def send_email(html_body: str, plain_body: str, subject: str) -> bool:
         print(f"[OK] Email sent to {RECIPIENT}")
         return True
     except Exception as e:
-        print(f"[ERROR] {e}", file=sys.stderr)
+        print(f"[ERROR] SMTP: {e}", file=sys.stderr)
         return False
 
 
@@ -389,13 +471,16 @@ def main():
 
     # Fetch all feeds
     all_items = []
+    errors = []
     for name, url, area in THINK_TANKS:
         print(f"  [{name}] fetching...", end=" ", flush=True)
         items = fetch_rss(url)
         new_items = [i for i in items if i["hash"] not in seen]
         print(f"{len(items)} total, {len(new_items)} new")
         all_items.append((name, area, new_items))
-        time.sleep(1)  # Be polite to servers
+        if not items:
+            errors.append(name)
+        time.sleep(1)
 
     # Group by area
     new_by_area: dict[str, dict[str, list[dict]]] = {}
@@ -411,6 +496,11 @@ def main():
 
     print(f"\nNew items: {total_new}")
 
+    # Report errors
+    if errors:
+        print(f"Feeds with errors ({len(errors)}/{len(THINK_TANKS)}): {', '.join(errors)}")
+        print(f"  (These sites may block automated access or have changed their feed URLs.)")
+
     if dry_run:
         print("\n=== DRY RUN — No email sent ===\n")
         for area_name, tanks in new_by_area.items():
@@ -425,7 +515,6 @@ def main():
 
     if total_new == 0:
         print("No new items — skipping email.")
-        # Update state even if no new items
         state["last_run"] = today
         save_state(state)
         return
